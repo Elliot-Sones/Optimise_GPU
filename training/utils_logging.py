@@ -256,6 +256,9 @@ class TrainLogEntry:
     amp_scale: float = 1.0
     amp_overflow: bool = False
     
+    # Throughput
+    positions_per_sec: float = 0.0
+    step_time_ms: float = 0.0
     mfu_percent: float = 0.0
     tflops_per_sec: float = 0.0
     

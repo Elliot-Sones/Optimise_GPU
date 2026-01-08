@@ -25,7 +25,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -298,7 +299,6 @@ def train_step(
     value_weight: float,
     device: torch.device,
     use_amp: bool,
-    use_amp: bool,
     logger: MetricsLogger,
 ) -> Tuple[float, float, float, float, float]:
     """
@@ -311,7 +311,7 @@ def train_step(
     
     boards = boards.to(device, non_blocking=True)
     policy_targets = policy_targets.to(device, non_blocking=True)
-    value_targets = value_targets.to(device, non_blocking=True)
+    value_targets = value_targets.to(device, non_blocking=True).float()
     
     # Get legal mask if provided
     legal_mask = None
@@ -322,7 +322,7 @@ def train_step(
     
     logger.timers.start('compute')
     
-    with autocast(device_type='cuda', enabled=use_amp):
+    with autocast('cuda', enabled=use_amp):
         policy_logits, value_pred = model(boards, legal_mask)
         
         # Policy loss: cross-entropy with one-hot targets
@@ -428,6 +428,28 @@ def evaluate_offline(
 
 
 # ============================================================================
+# GPU utilities
+# ============================================================================
+
+def get_gpu_peak_flops() -> float:
+    """Estimated Peak FLOPS for common GPUs (FP16 Tensor Core)."""
+    if not torch.cuda.is_available():
+        return 1.0
+    
+    name = torch.cuda.get_device_name(0).lower()
+    
+    # FP16 Tensor Core Peak estimations (approximate)
+    if "4090" in name: return 330e12
+    if "a100" in name: return 312e12
+    if "3090" in name: return 142e12
+    if " t4" in name: return 65e12
+    if "v100" in name: return 125e12
+    
+    # Default fallback: 100 TFLOPS
+    return 100e12
+
+
+# ============================================================================
 # Main training loop
 # ============================================================================
 
@@ -454,46 +476,22 @@ def train(args):
     model = create_model(args.model_variant, **model_kwargs)
     model = model.to(device)
     
+    # Calculate FLOPs
+    from models import estimate_flops
+    flops_per_pos = estimate_flops(model)
+    peak_flops = get_gpu_peak_flops()
+    
     if is_main_process():
         print(f"\n{'='*60}")
         print(f"AlphaZero Chess Training")
         print(f"{'='*60}")
         print(f"Model: {args.model_variant} ({count_parameters(model):,} params)")
-        
-        # Calculate FLOPs
-        from models import estimate_flops
-        flops_per_pos = estimate_flops(model)
-        peak_flops = get_gpu_peak_flops()
         print(f"FLOPs per position: {flops_per_pos:.2e}")
         print(f"Approximated GPU Peak TFLOPS: {peak_flops/1e12:.1f}")
-        
         print(f"Device: {device}")
         print(f"World size: {world_size}")
         print(f"Batch size: {args.batch_size} x {world_size} = {args.batch_size * world_size}")
         print(f"{'='*60}\n")
-    else:
-        # Worker processes need these too
-        from models import estimate_flops
-        flops_per_pos = estimate_flops(model)
-        peak_flops = get_gpu_peak_flops()
-
-
-def get_gpu_peak_flops() -> float:
-    """Estimated Peak FLOPS for common GPUs (FP16 Tensor Core)."""
-    if not torch.cuda.is_available():
-        return 1.0
-    
-    name = torch.cuda.get_device_name(0).lower()
-    
-    # FP16 Tensor Core Peak estimations (approximate)
-    if "4090" in name: return 330e12  # ~83 TFLOPS * ~4 (Tensor Core / Sparsity) -> simpler: 165 dense
-    if "a100" in name: return 312e12
-    if "3090" in name: return 142e12
-    if " t4" in name: return 65e12
-    if "v100" in name: return 125e12
-    
-    # Default fallback: 100 TFLOPS
-    return 100e12
     
     # torch.compile
     if args.compile and hasattr(torch, 'compile'):
@@ -638,7 +636,6 @@ def get_gpu_peak_flops() -> float:
                 value_loss=value_loss,
                 total_loss=total_loss,
                 lr=current_lr,
-                lr=current_lr,
                 grad_norm=grad_norm,
                 amp_scale=amp_scale if isinstance(amp_scale, float) else amp_scale.item(),
                 amp_overflow=bool(amp_overflow) if not isinstance(amp_overflow, bool) else amp_overflow,
@@ -653,7 +650,7 @@ def get_gpu_peak_flops() -> float:
             print(f"Saved checkpoint: {ckpt_path}")
         
         # Offline evaluation
-        if eval_loader and args.eval_every > 0 and step > 0 and step % args.eval_every == 0:
+        if eval_loader is not None and args.eval_every > 0 and step > 0 and step % args.eval_every == 0:
             if is_main_process():
                 accuracy, mse, num_samples = evaluate_offline(model, eval_loader, device)
                 if logger:

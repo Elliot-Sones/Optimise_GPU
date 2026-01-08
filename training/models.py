@@ -183,8 +183,8 @@ class ChessResNet(nn.Module):
         
         # Apply legal move mask
         if legal_mask is not None:
-            # Set illegal moves to very negative value
-            policy_logits = policy_logits.masked_fill(legal_mask == 0, -1e9)
+            # Set illegal moves to very negative value (must fit in float16 for AMP)
+            policy_logits = policy_logits.masked_fill(legal_mask == 0, -1e4)
         
         return policy_logits, value
     
@@ -355,7 +355,7 @@ def test_model_forward():
     
     # Check mask applied
     illegal_positions = (mask == 0)
-    assert (policy_masked[illegal_positions] == -1e9).all(), "Mask not applied correctly"
+    assert (policy_masked[illegal_positions] == -1e4).all(), "Mask not applied correctly"
     
     # Test predict
     probs, _ = model.predict(x, mask)

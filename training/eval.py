@@ -110,21 +110,32 @@ class NNPlayer:
         
         # Get legal mask
         legal_mask = get_legal_mask(board)
-        legal_mask = torch.from_numpy(legal_mask).unsqueeze(0).to(self.device)
+        legal_mask_tensor = torch.from_numpy(legal_mask).unsqueeze(0).to(self.device)
         
         # Forward pass
-        policy_logits, value = self.model(board_tensor, legal_mask)
+        policy_logits, value = self.model(board_tensor, legal_mask_tensor)
+        policy_logits = policy_logits.squeeze(0).cpu().numpy()
         
-        if self.temperature > 0:
-            # Sample from policy
-            probs = F.softmax(policy_logits / self.temperature, dim=-1)
-            action_idx = torch.multinomial(probs, 1).item()
-        else:
-            # Greedy
-            action_idx = policy_logits.argmax(dim=-1).item()
+        # Only consider legal moves - iterate through legal moves and find max logit
+        best_move = None
+        best_logit = float('-inf')
         
-        # Convert to move
-        return index_to_move(action_idx, board)
+        for move in board.legal_moves:
+            try:
+                idx = move_to_index(move, board.turn)
+                logit = policy_logits[idx]
+                if logit > best_logit:
+                    best_logit = logit
+                    best_move = move
+            except ValueError:
+                # Skip moves that can't be encoded
+                continue
+        
+        if best_move is None:
+            # Fallback: return first legal move
+            best_move = list(board.legal_moves)[0]
+        
+        return best_move
     
     def get_value(self, board: chess.Board) -> float:
         """Get value prediction for position."""
@@ -492,7 +503,7 @@ def main():
     
     # Load model
     print(f"Loading model from {args.model}...")
-    checkpoint = torch.load(args.model, map_location=device)
+    checkpoint = torch.load(args.model, map_location=device, weights_only=False)
     
     # Get model config from checkpoint
     ckpt_args = checkpoint.get('args', {})
@@ -507,7 +518,18 @@ def main():
         model_kwargs['channels'] = channels
     
     model = create_model(model_variant, **model_kwargs)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Handle torch.compile prefix in state dict keys
+    state_dict = checkpoint['model_state_dict']
+    # Strip '_orig_mod.' prefix if present (from torch.compile)
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith('_orig_mod.'):
+            new_state_dict[k[len('_orig_mod.'):]] = v
+        else:
+            new_state_dict[k] = v
+    
+    model.load_state_dict(new_state_dict)
     model = model.to(device)
     
     if args.mode == "offline":
