@@ -1,0 +1,21 @@
+# AlphaZero Chess Training
+# Core ML
+torch>=2.0.0
+numpy>=1.24.0
+
+# Chess
+python-chess>=1.999
+
+# Data streaming
+zstandard>=0.21.0
+
+# Logging & visualization
+tensorboard>=2.14.0
+matplotlib>=3.7.0
+tqdm>=4.65.0
+
+# System monitoring
+psutil>=5.9.0
+
+# Optional: for faster JSON
+orjson>=3.9.0
