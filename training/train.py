@@ -111,6 +111,14 @@ def parse_args():
                         help="Log every N steps")
     parser.add_argument("--tensorboard", action="store_true",
                         help="Enable TensorBoard logging")
+    parser.add_argument("--wandb", action="store_true",
+                        help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", type=str, default="chess-alpha-zero",
+                        help="W&B project name")
+    parser.add_argument("--wandb-entity", type=str, default=None,
+                        help="W&B entity (username/team)")
+    parser.add_argument("--wandb-group", type=str, default=None,
+                        help="W&B run group")
     
     # Evaluation
     parser.add_argument("--eval-every", type=int, default=5000,
@@ -290,13 +298,14 @@ def train_step(
     value_weight: float,
     device: torch.device,
     use_amp: bool,
+    use_amp: bool,
     logger: MetricsLogger,
-) -> Tuple[float, float, float, float]:
+) -> Tuple[float, float, float, float, float]:
     """
     Execute single training step.
     
     Returns:
-        policy_loss, value_loss, total_loss, grad_norm
+        policy_loss, value_loss, total_loss, grad_norm, entropy
     """
     boards, policy_targets, value_targets = batch[:3]
     
@@ -320,6 +329,11 @@ def train_step(
         # Convert one-hot to class indices
         policy_targets_idx = policy_targets.argmax(dim=-1)
         policy_loss = F.cross_entropy(policy_logits, policy_targets_idx)
+        
+        # Entropy (for monitoring exploration/collapse)
+        probs = F.softmax(policy_logits, dim=-1)
+        log_probs = F.log_softmax(policy_logits, dim=-1)
+        entropy = -(probs * log_probs).sum(dim=-1).mean()
         
         # Value loss: MSE
         value_loss = F.mse_loss(value_pred, value_targets)
@@ -349,6 +363,7 @@ def train_step(
         value_loss.item(),
         total_loss.item(),
         grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+        entropy.item(),
     )
 
 
@@ -444,10 +459,41 @@ def train(args):
         print(f"AlphaZero Chess Training")
         print(f"{'='*60}")
         print(f"Model: {args.model_variant} ({count_parameters(model):,} params)")
+        
+        # Calculate FLOPs
+        from models import estimate_flops
+        flops_per_pos = estimate_flops(model)
+        peak_flops = get_gpu_peak_flops()
+        print(f"FLOPs per position: {flops_per_pos:.2e}")
+        print(f"Approximated GPU Peak TFLOPS: {peak_flops/1e12:.1f}")
+        
         print(f"Device: {device}")
         print(f"World size: {world_size}")
         print(f"Batch size: {args.batch_size} x {world_size} = {args.batch_size * world_size}")
         print(f"{'='*60}\n")
+    else:
+        # Worker processes need these too
+        from models import estimate_flops
+        flops_per_pos = estimate_flops(model)
+        peak_flops = get_gpu_peak_flops()
+
+
+def get_gpu_peak_flops() -> float:
+    """Estimated Peak FLOPS for common GPUs (FP16 Tensor Core)."""
+    if not torch.cuda.is_available():
+        return 1.0
+    
+    name = torch.cuda.get_device_name(0).lower()
+    
+    # FP16 Tensor Core Peak estimations (approximate)
+    if "4090" in name: return 330e12  # ~83 TFLOPS * ~4 (Tensor Core / Sparsity) -> simpler: 165 dense
+    if "a100" in name: return 312e12
+    if "3090" in name: return 142e12
+    if " t4" in name: return 65e12
+    if "v100" in name: return 125e12
+    
+    # Default fallback: 100 TFLOPS
+    return 100e12
     
     # torch.compile
     if args.compile and hasattr(torch, 'compile'):
@@ -505,6 +551,11 @@ def train(args):
             log_dir=args.log_dir,
             experiment_name=datetime.now().strftime("%Y%m%d_%H%M%S"),
             log_to_tensorboard=args.tensorboard,
+            log_to_wandb=args.wandb,
+            wandb_project=args.wandb_project,
+            wandb_entity=args.wandb_entity,
+            wandb_group=args.wandb_group,
+            config=vars(args),
             print_every=args.log_every,
         )
     
@@ -540,7 +591,11 @@ def train(args):
     while step < args.total_steps:
         # Get batch
         if logger:
-            logger.start_step(args.batch_size)
+            logger.start_step(
+                batch_size=args.batch_size,
+                flops_per_position=flops_per_pos,
+                gpu_peak_flops=peak_flops
+            )
             logger.timers.start('data')
         
         try:
@@ -554,7 +609,7 @@ def train(args):
             logger.timers.stop('data')
         
         # Training step
-        policy_loss, value_loss, total_loss, grad_norm = train_step(
+        policy_loss, value_loss, total_loss, grad_norm, entropy = train_step(
             model=model,
             batch=batch,
             optimizer=optimizer,
@@ -583,9 +638,12 @@ def train(args):
                 value_loss=value_loss,
                 total_loss=total_loss,
                 lr=current_lr,
+                lr=current_lr,
                 grad_norm=grad_norm,
                 amp_scale=amp_scale if isinstance(amp_scale, float) else amp_scale.item(),
                 amp_overflow=bool(amp_overflow) if not isinstance(amp_overflow, bool) else amp_overflow,
+                entropy=entropy,
+                gpu_count=world_size,
             )
         
         # Checkpointing

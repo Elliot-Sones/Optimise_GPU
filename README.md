@@ -20,43 +20,49 @@ pip install -r requirements.txt
 
 **Requirements**: Python 3.8+, CUDA-capable GPU recommended
 
-### 1. Download Data (Terminal)
+### 1. Download Data
+Download Lichess game database (approx 30GB compressed):
 ```bash
-# Create data folder
 mkdir -p data
-
-# Download one month of Lichess data (approx 30GB compressed)
-# This is enough for 2000 Elo!
 wget https://database.lichess.org/standard/lichess_db_standard_rated_2024-01.pgn.zst -P data/
 ```
 
-### 2. Start Training (Optimized for Single GPU)
+### 2. Prepare Validation Split (Optional but Recommended)
+Extract 5,000 games to track how well your model generalizes:
 ```bash
-# Run from the project root
+python3 scripts/make_val_split.py data/lichess_db_standard_rated_2024-01.pgn.zst data/val.pgn.zst 5000
+```
+
+### 3. Start Training (Optimized & Monitored)
+Track everything with **Weights & Biases** (requires `pip install wandb`):
+
+```bash
+# Login once
+wandb login
+
+# Single GPU Training
 python3 training/train.py \
-    --pgn-files data/*.pgn.zst \
+    --pgn-files data/lichess_db_standard_rated_2024-01.pgn.zst \
+    --eval-pgn data/val.pgn.zst \
+    --eval-every 5000 \
     --batch-size 1024 \
     --compile \
-    --total-steps 100000 \
     --lr 2e-4 \
-    --save-every 5000
+    --total-steps 100000 \
+    --wandb \
+    --wandb-project chess-training
 ```
-*Note: If you run out of memory, lower batch-size to 512.*
 
-### 3. Monitor (New Terminal)
-```bash
-# Watch GPU utilization in real-time
-nvidia-smi dmon -s u
-```
-*Goal: Keep `sm` (Compute) and `mem` (Memory) as high as possible!*
+**Key Flags Explained:**
+*   `--compile`: Uses PyTorch 2.0+ optimization (huge speedup).
+*   `--wandb`: Live dashboards for Loss, **MFU** (Efficiency), and Hardware Health.
+*   `--eval-pgn`: Checks accuracy on unseen games every 5k steps.
 
-### Rented GPU (Single Terminal)?
-Use `tmux` to split your screen:
-1. Start tmux: `tmux`
-2. Start training.
-3. Split screen: Press `Ctrl+B`, then `%` (shift+5).
-4. Run monitoring in the new pane: `nvidia-smi dmon -s u`
-5. Switch panes: Press `Ctrl+B`, then arrow keys.
+### Monitoring
+Check your W&B dashboard for:
+*   **Throughput/MFU**: Aim for >30%.
+*   **System/GPU Util**: Should stay near 100%.
+*   **Eval/Policy Accuracy**: Should climb steadily.
 
 
 

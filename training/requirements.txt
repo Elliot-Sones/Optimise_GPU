@@ -19,3 +19,6 @@ psutil>=5.9.0
 
 # Optional: for faster JSON
 orjson>=3.9.0
+
+# Monitoring
+wandb>=0.16.0

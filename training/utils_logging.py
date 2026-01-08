@@ -43,6 +43,11 @@ try:
 except ImportError:
     USE_ORJSON = False
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 
 # ============================================================================
 # Timer utilities
@@ -241,6 +246,7 @@ class TrainLogEntry:
     policy_loss: float = 0.0
     value_loss: float = 0.0
     total_loss: float = 0.0
+    entropy: float = 0.0
     
     # Optimizer
     lr: float = 0.0
@@ -250,9 +256,8 @@ class TrainLogEntry:
     amp_scale: float = 1.0
     amp_overflow: bool = False
     
-    # Throughput
-    positions_per_sec: float = 0.0
-    step_time_ms: float = 0.0
+    mfu_percent: float = 0.0
+    tflops_per_sec: float = 0.0
     
     # Timing breakdown
     data_time_ms: float = 0.0
@@ -264,6 +269,11 @@ class TrainLogEntry:
     gpu_mem_mb: float = 0.0
     gpu_mem_peak_mb: float = 0.0
     cpu_util_percent: float = 0.0
+    cpu_mem_percent: float = 0.0
+    
+    # Scaling
+    gpu_count: int = 1
+    effective_batch_size: int = 256
 
 
 @dataclass
@@ -312,6 +322,11 @@ class MetricsLogger:
         log_to_jsonl: bool = True,
         log_to_csv: bool = True,
         log_to_tensorboard: bool = False,
+        log_to_wandb: bool = False,
+        wandb_project: Optional[str] = None,
+        wandb_entity: Optional[str] = None,
+        wandb_group: Optional[str] = None,
+        config: Optional[Dict] = None,
         print_every: int = 1,
     ):
         self.log_dir = log_dir
@@ -320,7 +335,18 @@ class MetricsLogger:
         self.log_to_jsonl = log_to_jsonl
         self.log_to_csv = log_to_csv
         self.log_to_tensorboard = log_to_tensorboard
+        self.log_to_wandb = log_to_wandb and (wandb is not None)
         self.print_every = print_every
+        
+        # Initialize W&B
+        if self.log_to_wandb:
+            wandb.init(
+                project=wandb_project,
+                entity=wandb_entity,
+                group=wandb_group,
+                name=self.experiment_name,
+                config=config,
+            )
         
         # Create log directory
         os.makedirs(log_dir, exist_ok=True)
@@ -343,12 +369,16 @@ class MetricsLogger:
         # Statistics
         self.step_times = WindowStats(100)
         self.throughput_ema = MovingAverage(0.1)
+        self.tflops_ema = MovingAverage(0.1)
+        self.mfu_ema = MovingAverage(0.1)
         
         # Timers
         self.timers = TimerCollection()
         
         self._step_start_time = None
         self._positions_this_step = 0
+        self._flops_per_position = 0.0
+        self._gpu_peak_flops = 0.0
     
     def _get_jsonl_file(self):
         if self._jsonl_file is None and self.log_to_jsonl:
@@ -390,13 +420,17 @@ class MetricsLogger:
             self._tb_writer.add_scalar('lr', entry.lr, entry.step)
             self._tb_writer.add_scalar('grad_norm', entry.grad_norm, entry.step)
             self._tb_writer.add_scalar('throughput/positions_per_sec', entry.positions_per_sec, entry.step)
+            self._tb_writer.add_scalar('throughput/tflops', entry.tflops_per_sec, entry.step)
+            self._tb_writer.add_scalar('throughput/mfu', entry.mfu_percent, entry.step)
             self._tb_writer.add_scalar('gpu/memory_mb', entry.gpu_mem_mb, entry.step)
             self._tb_writer.add_scalar('gpu/utilization', entry.gpu_util_percent, entry.step)
     
-    def start_step(self, batch_size: int = 0):
+    def start_step(self, batch_size: int = 0, flops_per_position: float = 0.0, gpu_peak_flops: float = 1.0):
         """Call at the start of each training step."""
         self._step_start_time = time.perf_counter()
         self._positions_this_step = batch_size
+        self._flops_per_position = flops_per_position
+        self._gpu_peak_flops = gpu_peak_flops
         self.timers.reset_all()
     
     def log_train_step(
@@ -410,6 +444,8 @@ class MetricsLogger:
         grad_norm: float = 0.0,
         amp_scale: float = 1.0,
         amp_overflow: bool = False,
+        entropy: float = 0.0,
+        gpu_count: int = 1,
         extra: Optional[Dict[str, Any]] = None,
     ):
         """Log a training step."""
@@ -422,9 +458,25 @@ class MetricsLogger:
         
         # Calculate throughput
         positions_per_sec = 0.0
+        tflops = 0.0
+        mfu = 0.0
+        
         if step_time > 0:
-            positions_per_sec = self._positions_this_step / (step_time / 1000)
+            seconds = step_time / 1000
+            positions_per_sec = self._positions_this_step / seconds
+            
+            # TFLOPS = (OPS per pos * pos per sec) / 1e12
+            # 3x factor for backward pass (1 fw + 2 bw)
+            total_ops = self._flops_per_position * self._positions_this_step * 3
+            tflops = total_ops / seconds / 1e12
+            
+            # MFU = TFLOPS / Peak TFLOPS
+            if self._gpu_peak_flops > 0:
+                mfu = (tflops / (self._gpu_peak_flops / 1e12)) * 100
+            
             self.throughput_ema.update(positions_per_sec)
+            self.tflops_ema.update(tflops)
+            self.mfu_ema.update(mfu)
         
         # Get system metrics
         gpu_metrics = get_gpu_metrics()
@@ -445,6 +497,8 @@ class MetricsLogger:
             amp_scale=amp_scale,
             amp_overflow=amp_overflow,
             positions_per_sec=positions_per_sec,
+            tflops_per_sec=tflops,
+            mfu_percent=mfu,
             step_time_ms=step_time,
             data_time_ms=timings.get('data', 0.0) * 1000,
             compute_time_ms=timings.get('compute', 0.0) * 1000,
@@ -453,12 +507,45 @@ class MetricsLogger:
             gpu_mem_mb=gpu_metrics.memory_allocated_mb,
             gpu_mem_peak_mb=gpu_metrics.memory_peak_mb,
             cpu_util_percent=cpu_metrics.utilization_percent,
+            cpu_mem_percent=cpu_metrics.memory_percent,
+            gpu_count=gpu_count,
+            effective_batch_size=self._positions_this_step * gpu_count,  # positions_this_step is usually local batch
         )
         
         # Write to files
         self._write_jsonl(entry)
         self._write_csv(entry)
         self._write_tensorboard(entry)
+        
+        # Write to W&B
+        if self.log_to_wandb:
+            wandb.log({
+                # Learning
+                "learning/loss_total": entry.total_loss,
+                "learning/loss_policy": entry.policy_loss,
+                "learning/loss_value": entry.value_loss,
+                "learning/entropy": entry.entropy,
+                "learning/lr": entry.lr,
+                "learning/grad_norm": entry.grad_norm,
+                
+                # Speed
+                "speed/positions_per_sec": entry.positions_per_sec,
+                "speed/step_time_ms": entry.step_time_ms,
+                
+                # Compute
+                "compute/mfu": entry.mfu_percent,
+                "compute/tflops": entry.tflops_per_sec,
+                "compute/gpu_util": entry.gpu_util_percent,
+                "compute/vram_mb": entry.gpu_mem_mb,
+                
+                # Scaling
+                "scaling/gpu_count": entry.gpu_count,
+                "scaling/effective_batch_size": entry.effective_batch_size,
+                
+                # System
+                "system/cpu_util": entry.cpu_util_percent,
+                "system/cpu_mem": entry.cpu_mem_percent,
+            }, step=step)
         
         # Print to stdout
         if self.log_to_stdout and step % self.print_every == 0:
@@ -470,9 +557,9 @@ class MetricsLogger:
         
         print(
             f"Step {entry.step:6d} | "
-            f"Loss: {entry.total_loss:.4f} (P:{entry.policy_loss:.4f} V:{entry.value_loss:.4f}) | "
+            f"Loss: {entry.total_loss:.4f} (P:{entry.policy_loss:.4f}) | "
             f"LR: {entry.lr:.2e} | "
-            f"Grad: {entry.grad_norm:.2f} | "
+            f"MFU: {entry.mfu_percent:.1f}% ({entry.tflops_per_sec:.1f} TF) | "
             f"Speed: {entry.positions_per_sec:.0f} pos/s | "
             f"GPU: {entry.gpu_mem_mb:.0f}MB{overflow_str}"
         )
@@ -522,6 +609,19 @@ class MetricsLogger:
                 self._tb_writer.add_scalar('eval/elo', elo_estimate, step)
                 self._tb_writer.add_scalar('eval/score', score, step)
         
+        if self.log_to_wandb:
+            if eval_type == "offline":
+                wandb.log({
+                    "learning/eval_policy_accuracy": policy_accuracy,
+                    "learning/eval_value_mse": value_mse,
+                }, step=step)
+            else:
+                wandb.log({
+                    "learning/elo": elo_estimate,
+                    "learning/win_rate": score,
+                    "learning/elo_games": games_played,
+                }, step=step)
+        
         if self.log_to_stdout:
             self._print_eval(entry)
     
@@ -562,6 +662,8 @@ class MetricsLogger:
         if self._tb_writer:
             self._tb_writer.close()
             self._tb_writer = None
+        if self.log_to_wandb:
+            wandb.finish()
     
     def __enter__(self):
         return self

@@ -247,13 +247,26 @@ def plot_training(entries: List[Dict], output_dir: str = None):
     ax.legend(loc='upper left')
     ax.grid(True, alpha=0.3)
     
-    # GPU memory
+    # MFU Efficiency Plot
     ax = axes[1, 1]
-    gpu_mem = [e.get('gpu_mem_mb', 0) for e in train_entries]
-    ax.plot(steps, gpu_mem, color='purple', alpha=0.7)
+    mfu = [e.get('mfu_percent', 0) for e in train_entries]
+    tflops = [e.get('tflops_per_sec', 0) for e in train_entries]
+    
+    color = 'tab:red'
     ax.set_xlabel('Step')
-    ax.set_ylabel('GPU Memory (MB)')
-    ax.set_title('GPU Memory Usage')
+    ax.set_ylabel('MFU (%)', color=color)
+    ax.plot(steps, mfu, color=color, alpha=0.9, label='MFU %')
+    ax.tick_params(axis='y', labelcolor=color)
+    ax.set_ylim(0, 100)
+    
+    # Twin axis for TFLOPS
+    ax2 = ax.twinx()
+    color = 'tab:blue'
+    ax2.set_ylabel('TFLOPS', color=color)
+    ax2.plot(steps, tflops, color=color, alpha=0.3, label='TFLOPS')
+    ax2.tick_params(axis='y', labelcolor=color)
+    
+    ax.set_title('Efficiency (MFU & TFLOPS)')
     ax.grid(True, alpha=0.3)
     
     plt.tight_layout()

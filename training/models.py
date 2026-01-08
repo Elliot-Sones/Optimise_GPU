@@ -282,6 +282,44 @@ def model_summary(model: ChessResNet):
     print(f"  Blocks: {model.num_blocks}")
     print(f"  Channels: {model.channels}")
     print(f"  Parameters: {count_parameters(model):,}")
+    print(f"  Flops/Step: {estimate_flops(model):.2e}")
+
+
+def estimate_flops(model: ChessResNet) -> float:
+    """
+    Estimate max FLOPs per forward pass (batch size 1).
+    
+    Formula assumes:
+    - Conv2d: 2 * Cin * Cout * K * K * H * W
+    - Linear: 2 * Cin * Cout
+    - BatchNorm/ReLU: Negligible
+    """
+    flops = 0
+    H, W = 8, 8
+    
+    # Stem: Conv 3x3
+    flops += 2 * 18 * model.channels * 3 * 3 * H * W
+    
+    # Residual blocks
+    # Each block: 2 * Conv(C, C, 3, 3)
+    block_flops = 2 * (2 * model.channels * model.channels * 3 * 3 * H * W)
+    flops += model.num_blocks * block_flops
+    
+    # Policy Head
+    # Conv 1x1: C -> 32
+    flops += 2 * model.channels * 32 * 1 * 1 * H * W
+    # Linear: 32*64 -> NUM_ACTIONS
+    flops += 2 * (32 * 64) * NUM_ACTIONS
+    
+    # Value Head
+    # Conv 1x1: C -> 1
+    flops += 2 * model.channels * 1 * 1 * 1 * H * W
+    # Linear: 64 -> 256
+    flops += 2 * 64 * 256
+    # Linear: 256 -> 1
+    flops += 2 * 256 * 1
+    
+    return float(flops)
     
     # Test forward pass
     x = torch.randn(1, 18, 8, 8)
